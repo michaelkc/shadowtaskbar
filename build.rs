@@ -14,4 +14,10 @@ fn main() {
     println!("cargo:rustc-env=SHADOWTASKBAR_GIT_SHA={sha}");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+
+    println!("cargo:rerun-if-changed=icon.ico");
+    winres::WindowsResource::new()
+        .set_icon("icon.ico")
+        .compile()
+        .expect("failed to embed icon.ico into the exe");
 }
