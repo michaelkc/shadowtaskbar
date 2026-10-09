@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod pacman;
+
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use windows::core::{w, HSTRING};
@@ -7,7 +9,9 @@ use windows::Win32::Foundation::{
     CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT,
     WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetStockObject, InvalidateRect, BLACK_BRUSH, HBRUSH, HDC, PAINTSTRUCT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
@@ -19,17 +23,25 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, IDC_ARROW, LoadCursorW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
-    SetWindowPos, TrackPopupMenu, TranslateMessage, HWND_BOTTOM, HWND_TOPMOST, MF_DISABLED,
-    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, TPM_RIGHTBUTTON, WINDOWPOS, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_CREATE, WM_DESTROY, WM_NULL, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WNDCLASSEXW,
-    WNDCLASS_STYLES, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, IDC_ARROW, KillTimer,
+    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SetForegroundWindow, SetTimer, SetWindowPos, TrackPopupMenu, TranslateMessage, HWND_BOTTOM,
+    HWND_TOPMOST, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN,
+    SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, TPM_RIGHTBUTTON, WINDOWPOS,
+    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_NULL,
+    WM_PAINT, WM_PRINTCLIENT, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WNDCLASSEXW,
+    WNDCLASS_STYLES,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 /// Menu command id for the "Exit" entry in the right-click context menu.
 const ID_EXIT: u32 = 1;
+/// Menu command id for the "Pac-Man (every 60s)" toggle.
+const ID_PACMAN: u32 = 2;
+/// Timer id for the 60s pacman cycle.
+const TIMER_CYCLE: usize = 1;
+/// Timer id for the per-frame animation tick.
+const TIMER_FRAME: usize = 2;
 /// Short git commit sha this binary was built from, baked in by build.rs.
 const GIT_SHA: &str = env!("SHADOWTASKBAR_GIT_SHA");
 
@@ -39,6 +51,47 @@ static BAR_HEIGHT: AtomicI32 = AtomicI32::new(48);
 static APPBAR_MSG_ID: AtomicU32 = AtomicU32::new(0);
 /// Guards WM_WINDOWPOSCHANGING so our own SetWindowPos calls aren't clamped.
 static IN_RESIZE: AtomicBool = AtomicBool::new(false);
+/// Whether the periodic pacman animation is enabled from the context menu.
+static PACMAN_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Current client size of the bar, in pixels.
+unsafe fn bar_size() -> (i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_CXSCREEN),
+            BAR_HEIGHT.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// Arms the pacman timers. Starts the first chase immediately so the option
+/// gives instant feedback rather than making you wait a minute.
+unsafe fn pacman_begin(hwnd: HWND) {
+    let (w, h) = bar_size();
+    if !pacman::start(w, h) {
+        return;
+    }
+    SetTimer(hwnd, TIMER_FRAME, pacman::TICK_MS, None);
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+/// Advances one animation frame and repaints. The frame timer is cleared as soon
+/// as the chase finishes, leaving the bar black until the next cycle.
+unsafe fn pacman_step(hwnd: HWND) {
+    let (w, h) = bar_size();
+    pacman::tick(w, h);
+    if !pacman::is_active() {
+        let _ = KillTimer(hwnd, TIMER_FRAME);
+    }
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+/// Draws a full frame of the bar into `dc`. Shared by WM_PAINT and WM_PRINTCLIENT
+/// so off-screen clients (screen-capture tools) see the same pixels we do.
+unsafe fn paint_bar(dc: HDC) {
+    let (w, h) = bar_size();
+    pacman::render(dc, w, h);
+}
 
 fn main() {
     unsafe {
@@ -174,6 +227,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = KillTimer(hwnd, TIMER_CYCLE);
+            let _ = KillTimer(hwnd, TIMER_FRAME);
+            pacman::dispose();
             let mut abd = APPBARDATA {
                 cbSize: std::mem::size_of::<APPBARDATA>() as u32,
                 hWnd: hwnd,
@@ -218,6 +274,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let header = HSTRING::from(format!("ShadowTaskbar ({GIT_SHA})"));
                 let _ = AppendMenuW(hmenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, &header);
                 let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
+
+                let pacman_state =
+                    if PACMAN_ENABLED.load(Ordering::SeqCst) { MF_CHECKED } else { MF_STRING };
+                let _ = AppendMenuW(
+                    hmenu,
+                    MF_STRING | pacman_state,
+                    ID_PACMAN as usize,
+                    w!("Pac-Man (every 60s)"),
+                );
+                let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
                 let _ = AppendMenuW(hmenu, MF_STRING, ID_EXIT as usize, w!("Exit"));
                 let _ = SetForegroundWindow(hwnd);
                 let _ = TrackPopupMenu(hmenu, TPM_RIGHTBUTTON, x, y, 0, hwnd, None);
@@ -227,10 +293,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_COMMAND => {
-            if (wparam.0 & 0xFFFF) as u32 == ID_EXIT {
-                let _ = DestroyWindow(hwnd);
+            match (wparam.0 & 0xFFFF) as u32 {
+                ID_EXIT => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                ID_PACMAN => {
+                    let on = !PACMAN_ENABLED.load(Ordering::SeqCst);
+                    PACMAN_ENABLED.store(on, Ordering::SeqCst);
+                    if on {
+                        // A chase already in flight still has to finish, so only
+                        // arm the cycle timer here.
+                        let _ = SetTimer(hwnd, TIMER_CYCLE, pacman::CYCLE_MS, None);
+                        pacman_begin(hwnd);
+                    } else {
+                        let _ = KillTimer(hwnd, TIMER_CYCLE);
+                    }
+                }
+                _ => {}
             }
             LRESULT(0)
+        }
+        WM_TIMER => {
+            match wparam.0 as usize {
+                TIMER_CYCLE => pacman_begin(hwnd),
+                TIMER_FRAME => pacman_step(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            paint_bar(dc);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_PRINTCLIENT => {
+            paint_bar(HDC(wparam.0 as _));
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => {
+            // Handled entirely in WM_PAINT; skipping this stops the flicker of
+            // the class background brush fighting the animation.
+            LRESULT(1)
         }
         WM_WINDOWPOSCHANGING => {
             if !IN_RESIZE.load(Ordering::SeqCst) {
