@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          sha=$(git rev-parse --short=7 HEAD)
+          zip="shadowtaskbar-rs-$sha-win-x64.zip"
+          7z a -tzip -mx=9 -mm=Deflate -mfb=258 -mpass=15 "$zip" ./target/x86_64-pc-windows-msvc/release/shadowtaskbar-rs.exe
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.pkg.outputs.sha }}" "${{ steps.pkg.outputs.zip }}" --target "$GITHUB_SHA" --title "${{ steps.pkg.outputs.sha }}"
